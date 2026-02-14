@@ -1,0 +1,10 @@
+torch>=2.0
+numpy
+scipy
+scikit-learn
+scanpy
+anndata
+pandas
+plotly
+tqdm
+pyyaml
