@@ -18,6 +18,7 @@ Reference:
 
 from __future__ import annotations
 
+import math
 import sys
 import os
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from torch import Tensor
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from st3d.data import NormParams
+from st3d.losses import sinkhorn_transport_plan
 
 
 # ---------------------------------------------------------------------------
@@ -357,5 +359,91 @@ def load_merfish(holdout_every: int = 3) -> MerfishSplit:
     )
 
 
+# ---------------------------------------------------------------------------
+# Sinkhorn transport plans between consecutive slices
+# ---------------------------------------------------------------------------
+
+def compute_transport_plans(
+    tensors: list[Tensor],
+    blur: float = 0.05,
+    n_iters: int = 100,
+    cost_coord_weight: float = 1.0,
+    cost_expr_weight: float = 1.0,
+    device: str = "cpu",
+) -> list[Tensor]:
+    """Compute entropic OT couplings between every consecutive pair of slices.
+
+    For each pair ``(tensors[k], tensors[k+1])`` this solves the static
+    Schrödinger bridge problem: find the coupling ``pi`` in ``R^{N_k x N_{k+1}}``
+    that minimises
+
+        sum_{i,j} C_{ij} pi_{ij} + eps * KL(pi || mu x nu)
+
+    where ``mu``, ``nu`` are uniform marginals and the cost matrix ``C`` is the
+    squared Euclidean distance over the joint (spatial + expression) feature
+    space, with configurable weighting between the two.
+
+    Args:
+        tensors: Preprocessed section tensors, each ``(N_i, 3 + n_pcs)``.
+            Must be in z-order (consecutive in physical space).
+        blur: Sinkhorn regularisation strength (epsilon = blur^2).
+            Smaller values give sharper (more deterministic) couplings but
+            need more iterations.  Larger values give smoother plans.
+        n_iters: Number of Sinkhorn iterations.
+        cost_coord_weight: Weight on the spatial (xyz) block of the cost.
+        cost_expr_weight: Weight on the expression (PC) block of the cost.
+        device: Device to run the computation on.
+
+    Returns:
+        List of ``len(tensors) - 1`` transport plan tensors.
+        ``plans[k]`` has shape ``(N_k, N_{k+1})`` and satisfies:
+        - rows sum to ``1 / N_k``   (source marginal)
+        - columns sum to ``1 / N_{k+1}`` (target marginal)
+    """
+    plans: list[Tensor] = []
+
+    for k in range(len(tensors) - 1):
+        t_src = tensors[k].to(device)
+        t_tgt = tensors[k + 1].to(device)
+
+        # Build weighted feature vectors for cost computation
+        coords_src = t_src[:, :3] * math.sqrt(cost_coord_weight)
+        expr_src = t_src[:, 3:] * math.sqrt(cost_expr_weight)
+        feat_src = torch.cat([coords_src, expr_src], dim=1)
+
+        coords_tgt = t_tgt[:, :3] * math.sqrt(cost_coord_weight)
+        expr_tgt = t_tgt[:, 3:] * math.sqrt(cost_expr_weight)
+        feat_tgt = torch.cat([coords_tgt, expr_tgt], dim=1)
+
+        pi = sinkhorn_transport_plan(feat_src, feat_tgt, blur=blur, n_iters=n_iters)
+        plans.append(pi.cpu())
+
+        # Transport cost for this pair: <C, pi>
+        C = torch.cdist(feat_src, feat_tgt, p=2.0).pow(2)
+        cost = (C * pi).sum().item()
+        print(f"  Pair {k} -> {k+1}:  "
+              f"{t_src.shape[0]:>5d} x {t_tgt.shape[0]:<5d}  "
+              f"transport cost = {cost:.4f}")
+
+    return plans
+
+
 if __name__ == "__main__":
     split = load_merfish(holdout_every=3)
+
+    print("\n" + "=" * 60)
+    print("Computing Sinkhorn transport plans between consecutive "
+          "training slices...")
+    print("=" * 60)
+    plans = compute_transport_plans(split.train_tensors)
+
+    # Quick sanity check: marginals
+    print("\nMarginal check (first plan):")
+    pi = plans[0]
+    row_sums = pi.sum(dim=1)
+    col_sums = pi.sum(dim=0)
+    N, M = pi.shape
+    print(f"  Row sums:  mean={row_sums.mean():.6f}  "
+          f"expected={1.0/N:.6f}  max_err={abs(row_sums - 1.0/N).max():.2e}")
+    print(f"  Col sums:  mean={col_sums.mean():.6f}  "
+          f"expected={1.0/M:.6f}  max_err={abs(col_sums - 1.0/M).max():.2e}")

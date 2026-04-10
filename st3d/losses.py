@@ -20,6 +20,50 @@ def _cost_matrix(x: Tensor, y: Tensor) -> Tensor:
     return torch.cdist(x, y, p=2.0).pow(2)
 
 
+def sinkhorn_transport_plan(
+    x: Tensor,
+    y: Tensor,
+    blur: float = 0.05,
+    n_iters: int = 50,
+    p: float = 2.0,
+) -> Tensor:
+    """Compute the entropic OT coupling (transport plan) between two point clouds.
+
+    Solves the static Schrödinger bridge problem: finds the joint distribution
+    ``pi`` in ``R^{N x M}`` that minimises transport cost plus KL divergence
+    from the product of uniform marginals, subject to marginal constraints.
+
+    Args:
+        x: Point cloud of shape ``(N, D)``.
+        y: Point cloud of shape ``(M, D)``.
+        blur: Entropic regularisation strength (epsilon = blur^p).
+        n_iters: Number of Sinkhorn iterations.
+        p: Exponent for the ground cost (default 2 = squared Euclidean).
+
+    Returns:
+        Transport plan ``pi`` of shape ``(N, M)`` where ``pi[i, j]`` is the
+        mass transported from ``x[i]`` to ``y[j]``.  Rows sum to ``1/N``,
+        columns sum to ``1/M``.
+    """
+    eps = blur ** p
+    N, M = x.shape[0], y.shape[0]
+
+    mu = torch.full((N,), -math.log(N) if N > 0 else 0.0, device=x.device, dtype=x.dtype)
+    nu = torch.full((M,), -math.log(M) if M > 0 else 0.0, device=y.device, dtype=y.dtype)
+
+    C = _cost_matrix(x, y)  # (N, M)
+
+    f = torch.zeros_like(mu)
+    g = torch.zeros_like(nu)
+    for _ in range(n_iters):
+        f = -eps * torch.logsumexp((-C + g[None, :]) / eps + nu[None, :], dim=1)
+        g = -eps * torch.logsumexp((-C + f[:, None]) / eps + mu[:, None], dim=0)
+
+    # Coupling in log-domain:  log pi_{ij} = log mu_i + log nu_j + (f_i + g_j - C_{ij}) / eps
+    log_pi = mu[:, None] + nu[None, :] + (f[:, None] + g[None, :] - C) / eps
+    return log_pi.exp()
+
+
 def sinkhorn_distance(
     x: Tensor,
     y: Tensor,
