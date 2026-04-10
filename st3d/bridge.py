@@ -33,6 +33,11 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
 
+import numpy as np
+
+import anndata as ad
+
+from st3d.data import NormParams, tensors_to_anndata
 from st3d.losses import sinkhorn_transport_plan
 
 
@@ -473,3 +478,255 @@ class IPFTrainer:
             self._update_couplings(is_forward=False)
 
         return self.history
+
+
+# ---------------------------------------------------------------------------
+# Partial SDE simulation (to an arbitrary bridge time)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def simulate_sde_to(
+    drift_net: TimeConditionedDriftNet,
+    x_init: Tensor,
+    sigma: float,
+    n_steps: int,
+    t_target: float,
+    forward: bool = True,
+) -> Tensor:
+    """Simulate the learned SDE to a target bridge time.
+
+    Forward:  integrates from ``t = 0`` to ``t = t_target``.
+    Backward: integrates from ``t = 1`` to ``t = t_target``.
+
+    The number of Euler--Maruyama steps is scaled proportionally to the
+    fraction of the unit interval being traversed, with a minimum of 1.
+
+    Args:
+        drift_net: Trained forward or backward drift network.
+        x_init: Initial states ``(N, D)``.
+        sigma: Diffusion coefficient.
+        n_steps: Steps for a *full* ``[0, 1]`` traversal.  Actual steps
+            used are ``max(1, round(n_steps * |t_span|))``.
+        t_target: Bridge time to integrate to.
+        forward: If ``True`` start at ``t = 0``; otherwise ``t = 1``.
+
+    Returns:
+        States ``(N, D)`` at ``t = t_target``.
+    """
+    t_start = 0.0 if forward else 1.0
+    t_span = abs(t_target - t_start)
+    actual_steps = max(1, round(n_steps * t_span))
+    dt = t_span / actual_steps
+    sqrt_dt = math.sqrt(dt)
+
+    x = x_init.clone()
+    t = torch.full((x.shape[0],), t_start, device=x.device)
+    sign = 1.0 if forward else -1.0
+
+    for _ in range(actual_steps):
+        v = drift_net(x, t)
+        x = x + v * dt + sigma * sqrt_dt * torch.randn_like(x)
+        t = t + sign * dt
+
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional blending between one pair of sections
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def bridge_interpolate(
+    model: SchrodingerBridgeModel,
+    u_start: Tensor,
+    u_end: Tensor,
+    n_interp: int,
+    sigma: float = 0.1,
+    sde_steps: int = 50,
+    device: torch.device | str = "cpu",
+) -> list[Tensor]:
+    """Interpolate between two consecutive sections using the learned SB.
+
+    For each target depth between the two observed sections:
+
+    1. **Forward prediction** — simulate the forward SDE from the source
+       section (``t = 0``) to the target bridge time ``alpha``.
+    2. **Backward prediction** — simulate the backward SDE from the
+       target section (``t = 1``) to the same bridge time ``alpha``.
+    3. **Blend** — linearly interpolate the two state predictions,
+       weighting each by proximity to its originating section::
+
+           x_blend = (1 - alpha) * x_fwd  +  alpha * x_bwd
+
+       Near the source (``alpha ~ 0``) the forward prediction dominates;
+       near the target (``alpha ~ 1``) the backward prediction dominates.
+
+    Because the forward and backward point clouds generally have different
+    sizes, the blend operates by:
+    - Keeping the larger cloud at full resolution.
+    - For each point in the larger cloud, finding its nearest neighbour in
+      the smaller cloud and blending their states.
+    This preserves spatial detail from whichever section has finer sampling.
+
+    Args:
+        model: Trained ``SchrodingerBridgeModel``.
+        u_start: State tensor for the earlier section ``(N, D)``.
+        u_end: State tensor for the later section ``(M, D)``.
+        n_interp: Number of interpolated layers to generate *between* the
+            two sections (excluding the endpoints).
+        sigma: Diffusion coefficient (must match training).
+        sde_steps: Euler--Maruyama steps for a full ``[0, 1]`` traversal.
+        device: Device to run on.
+
+    Returns:
+        List of ``n_interp`` state tensors for the interpolated layers.
+    """
+    model.eval()
+    u_start = u_start.to(device)
+    u_end = u_end.to(device)
+
+    z_a = u_start[:, 2].mean().item()
+    z_b = u_end[:, 2].mean().item()
+
+    # Evenly-spaced target bridge times, excluding endpoints
+    alphas = np.linspace(0.0, 1.0, n_interp + 2)[1:-1]
+
+    results: list[Tensor] = []
+
+    for alpha in alphas:
+        # Forward: source -> target time alpha
+        x_fwd = simulate_sde_to(
+            model.forward_drift, u_start, sigma,
+            n_steps=sde_steps, t_target=alpha, forward=True,
+        )
+
+        # Backward: target -> target time alpha
+        x_bwd = simulate_sde_to(
+            model.backward_drift, u_end, sigma,
+            n_steps=sde_steps, t_target=alpha, forward=False,
+        )
+
+        # ---- Bidirectional blending ----
+        # Determine which cloud is larger (anchor) vs smaller (match)
+        if x_fwd.shape[0] >= x_bwd.shape[0]:
+            anchor, match = x_fwd, x_bwd
+            w_anchor, w_match = 1.0 - alpha, alpha
+        else:
+            anchor, match = x_bwd, x_fwd
+            w_anchor, w_match = alpha, 1.0 - alpha
+
+        # For each anchor point, find its nearest neighbour in the match
+        # cloud using spatial coordinates (first 3 dims)
+        dists = torch.cdist(anchor[:, :3], match[:, :3])  # (A, M)
+        nn_idx = dists.argmin(dim=1)                       # (A,)
+        match_aligned = match[nn_idx]                      # (A, D)
+
+        blended = w_anchor * anchor + w_match * match_aligned
+
+        # Set the z-coordinate to the exact target depth
+        z_target = z_a + (z_b - z_a) * alpha
+        blended[:, 2] = z_target
+
+        results.append(blended.cpu())
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Full 3D volume reconstruction from the Schrödinger bridge
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def reconstruct_bridge_volume(
+    model: SchrodingerBridgeModel,
+    tensors: list[Tensor],
+    norm_params: NormParams,
+    sigma: float = 0.1,
+    sde_steps: int = 50,
+    n_interp_per_gap: int | None = None,
+    interp_spacing: float | None = None,
+    device: str = "auto",
+    inverse_pca: bool = True,
+    verbose: bool = True,
+) -> ad.AnnData:
+    """Reconstruct a dense 3D volume from observed sections using the trained SB.
+
+    For each pair of consecutive observed sections, generates interpolated
+    layers via bidirectional SDE simulation with distance-weighted blending,
+    then merges everything into a single AnnData.
+
+    The number of interpolated layers per gap can be set explicitly with
+    ``n_interp_per_gap`` (same count for every gap) or derived from
+    ``interp_spacing`` (approximate normalised-z distance between layers).
+    If neither is set, defaults to 5 interpolated layers per gap.
+
+    Args:
+        model: Trained ``SchrodingerBridgeModel``.
+        tensors: Preprocessed section tensors (z-ordered).
+        norm_params: ``NormParams`` for inverting back to AnnData.
+        sigma: Diffusion coefficient (must match training).
+        sde_steps: Euler--Maruyama steps for a full ``[0, 1]`` traversal.
+        n_interp_per_gap: Fixed number of interpolated layers between every
+            pair of consecutive observed sections.
+        interp_spacing: Target z-spacing for interpolated layers.  Overrides
+            ``n_interp_per_gap``.
+        device: ``"auto"`` / ``"cuda"`` / ``"mps"`` / ``"cpu"``.
+        inverse_pca: Invert PCA to gene-expression space in the output.
+        verbose: Show progress bar.
+
+    Returns:
+        AnnData with ``.obsm["spatial_3d"]``, ``.obs["z"]``,
+        ``.obs["is_observed"]``, and (optionally) ``.X`` in log-expression.
+    """
+    from st3d.training import get_device
+
+    dev = get_device(device)
+    model = model.to(dev)
+    model.eval()
+
+    all_states: list[Tensor] = []
+    is_observed: list[bool] = []
+
+    pairs = list(range(len(tensors) - 1))
+    iterator = tqdm(pairs, desc="Reconstructing (SB)", disable=not verbose)
+
+    for i in iterator:
+        # Add observed section
+        all_states.append(tensors[i])
+        is_observed.extend([True] * tensors[i].shape[0])
+
+        u_start = tensors[i]
+        u_end = tensors[i + 1]
+
+        z_a = u_start[:, 2].mean().item()
+        z_b = u_end[:, 2].mean().item()
+        gap = abs(z_b - z_a)
+
+        # Determine number of interpolated layers for this gap
+        if interp_spacing is not None:
+            n_interp = max(0, round(gap / interp_spacing) - 1)
+        elif n_interp_per_gap is not None:
+            n_interp = n_interp_per_gap
+        else:
+            n_interp = 5
+
+        if n_interp > 0:
+            interp_states = bridge_interpolate(
+                model, u_start, u_end,
+                n_interp=n_interp,
+                sigma=sigma,
+                sde_steps=sde_steps,
+                device=dev,
+            )
+            for s in interp_states:
+                all_states.append(s)
+                is_observed.extend([False] * s.shape[0])
+
+    # Add final observed section
+    all_states.append(tensors[-1])
+    is_observed.extend([True] * tensors[-1].shape[0])
+
+    # Convert to AnnData
+    adata = tensors_to_anndata(all_states, norm_params, inverse_pca=inverse_pca)
+    adata.obs["is_observed"] = is_observed
+    return adata
