@@ -121,7 +121,7 @@ def _nn_mse_and_correlation(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _predict_at_z(
+def predict_at_z(
     model: SchrodingerBridgeModel,
     u_left: Tensor,
     u_right: Tensor,
@@ -250,7 +250,7 @@ def evaluate_heldout(
         alpha = (h_z - z_left) / gap if gap > 0 else 0.5
 
         # --- Predict via bidirectional SDE ---
-        pred = _predict_at_z(
+        pred = predict_at_z(
             model,
             train_tensors[left_idx],
             train_tensors[right_idx],
