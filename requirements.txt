@@ -1,0 +1,11 @@
+torch>=2.0
+numpy
+scipy
+scikit-learn
+scanpy
+squidpy
+anndata
+POT
+geomloss
+tqdm
+matplotlib
